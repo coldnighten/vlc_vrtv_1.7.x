@@ -1,0 +1,146 @@
+name: Build ARMv8 (arm64-v8a)
+
+# 手动触发，避免每次 push 都跑 1~2 小时
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型 (release/debug)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+# 防止并发编译抢占资源
+concurrency:
+  group: build-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build VLC-Android ARMv8
+    runs-on: ubuntu-latest
+    # ubuntu-16.04 runner 已废弃，用容器保证老工具链兼容
+    container:
+      image: ubuntu:16.04
+    timeout-minutes: 240
+
+    env:
+      ANDROID_ABI: arm64-v8a
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
+
+    steps:
+      # ---------- 基础环境 ----------
+      - name: Install build dependencies
+        run: |
+          set -e
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            openjdk-8-jdk \
+            autoconf automake libtool pkg-config cmake \
+            git wget curl unzip patch yasm nasm \
+            build-essential g++ gcc \
+            ca-certificates \
+            python perl \
+            zlib1g-dev libssl-dev \
+            Ragel
+          # Ragel 在 16.04 上包名可能是 ragel，单独尝试一次
+          apt-get install -y --no-install-recommends ragel || true
+          # 设置 JAVA_HOME
+          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
+          echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
+
+      - name: Checkout source
+        uses: actions/checkout@v3
+
+      # ---------- Android SDK ----------
+      - name: Setup Android SDK
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          # SDK r24.4.1 (2016 年代，与 AGP 1.3.1 兼容)
+          wget -q https://dl.google.com/android/android-sdk_r24.4.1-linux.tgz
+          tar xzf android-sdk_r24.4.1-linux.tgz
+          export ANDROID_SDK=$PWD/android-sdk-linux
+          echo "ANDROID_SDK=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "$ANDROID_SDK/tools:$ANDROID_SDK/platform-tools" >> $GITHUB_PATH
+
+          # 静默安装所需 SDK 组件
+          echo "y" | android update sdk --no-ui --all --filter \
+            platform-tools,android-23,build-tools-23.0.2,extra-android-support \
+            --no-https
+
+      # ---------- Android NDK ----------
+      - name: Setup Android NDK r10e
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          # NDK r10e: 与 VLC 1.7.x 代码匹配，新版 NDK 编译不过
+          wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
+          unzip -q android-ndk-r10e-linux-x86_64.zip
+          export ANDROID_NDK=$PWD/android-ndk-r10e
+          echo "ANDROID_NDK=$ANDROID_NDK" >> $GITHUB_ENV
+
+      # ---------- 编译缓存（VLC 源码 + contrib 体积大）----------
+      - name: Cache VLC source
+        uses: actions/cache@v3
+        with:
+          path: vlc
+          key: vlc-src-c4cd717
+
+      # ---------- 编译 ----------
+      - name: Compile libVLC + APK
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          chmod +x compile.sh compile-libvlc.sh
+          # 确保 gradlew 可执行权限（compile.sh 会自动下载 gradle 2.6）
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./compile.sh --release -a $ANDROID_ABI
+          else
+            ./compile.sh -a $ANDROID_ABI
+          fi
+
+      # ---------- 调试：列出产物 ----------
+      - name: List build outputs
+        if: always()
+        run: |
+          echo "=== APK outputs ==="
+          ls -lh vlc-android/build/outputs/apk/ || true
+          echo "=== libvlcjni.so ==="
+          find vlc-android -name "libvlcjni.so" -exec ls -lh {} \; || true
+
+      # ---------- 上传产物 ----------
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: VLC-Android-${{ env.ANDROID_ABI }}-${{ env.BUILD_TYPE }}
+          path: |
+            vlc-android/build/outputs/apk/*.apk
+          retention-days: 30
+
+      - name: Upload libvlcjni.so (单独提取 native 库)
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: libvlcjni-${{ env.ANDROID_ABI }}
+          path: |
+            vlc-android/build/intermediates/ndkBuild/*/obj/arm64-v8a/libvlcjni.so
+            vlc-android/build/intermediates/ndkBuild/*/obj/arm64-v8a/libvlc.so
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ---------- 失败时上传日志 ----------
+      - name: Upload compile logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-logs-${{ env.ANDROID_ABI }}
+          path: |
+            vlc-android/build/outputs/logs/
+            **/*.log
+          if-no-files-found: ignore
+          retention-days: 7
